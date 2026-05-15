@@ -82,7 +82,9 @@ Project directories under `~/.claude/projects/` are stored with `/` replaced by
 `-`. The scanner decodes that heuristically; if the resolved path doesn't exist
 on disk anymore, the project still shows up but without the MD/CFG flags.
 
-Everything is read-only. The app never writes to `~/.claude`.
+The app is mostly read-only. The only write operation is the permissions editor,
+which rewrites `~/.claude/settings.json` (or a project's `settings.json`) when
+you add or remove allow / ask / deny rules.
 
 ## Project layout
 
@@ -106,8 +108,12 @@ claude-explorer/
 ## Notes
 
 - Tauri v2 syntax — `npm run tauri:dev`, not `cargo tauri dev`.
-- If you set `CLAUDE_CONFIG_DIR`, the scanner doesn't currently honor it. Open
-  an issue with yourself and add it to `scan_global()`.
+- If you set `CLAUDE_CONFIG_DIR`, the scanner honors it and reads from that
+  directory instead of `~/.claude`.
 - The icons in `src-tauri/icons/` aren't included — `tauri:build` will complain
   until you `npm run tauri icon path/to/icon.png` to generate them. Dev mode
   works without them.
+
+## License
+
+[MIT](LICENSE)
