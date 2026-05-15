@@ -22,13 +22,13 @@ fn write_settings(path: String, content: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn open_in_editor(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    use tauri_plugin_shell::ShellExt;
-    app.shell().open(&path, None).map_err(|e| e.to_string())
+    use tauri_plugin_opener::OpenerExt;
+    app.opener().open_path(&path, None::<&str>).map_err(|e| e.to_string())
 }
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![scan, read_text_file, write_settings, open_in_editor])
         .run(tauri::generate_context!())

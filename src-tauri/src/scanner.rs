@@ -587,26 +587,65 @@ fn scan_projects(
 }
 
 /// Project directories in ~/.claude/projects encode the absolute path by
-/// replacing `/` with `-`. This converts back heuristically.
+/// replacing `/` with `-`. This converts back by walking the real filesystem
+/// and trying every possible split of each `-` as either a path separator or
+/// a literal hyphen in a directory name.
 ///
-/// The naive approach (replace all `-` with `/`) works for paths whose
-/// directory components contain no dashes. For paths like `/Users/jane/my-project`,
-/// we first try the naive decode; if that path exists we're done. If not, we
-/// return the naive decode anyway and the caller emits a warning — the project
-/// will still appear in the list but without MD/CFG resolution.
-fn decode_project_dir(encoded: &str) -> String {
+/// For example `-Users-jane-my-project` is tried as:
+///   /Users/jane/my/project  (doesn't exist)
+///   /Users/jane/my-project  (exists → winner)
+///
+/// Falls back to the naive all-dashes-to-slashes decode when nothing resolves.
+fn resolve_project_path(encoded: &str) -> (String, bool) {
     if !encoded.starts_with('-') {
-        return encoded.to_string();
+        let p = PathBuf::from(encoded);
+        return (encoded.to_string(), p.exists());
     }
-    encoded.replace('-', "/")
+
+    // Strip the leading '-' which represents the root '/'
+    let rest = &encoded[1..];
+    if let Some(resolved) = search_from(rest, PathBuf::from("/")) {
+        return (resolved, true);
+    }
+
+    // Fall back to naive decode
+    let naive = encoded.replace('-', "/");
+    (naive, false)
 }
 
-/// Attempt to resolve a decoded project path. Returns the path string and
-/// whether it was confirmed to exist on disk.
-fn resolve_project_path(encoded: &str) -> (String, bool) {
-    let decoded = decode_project_dir(encoded);
-    let exists = PathBuf::from(&decoded).exists();
-    (decoded, exists)
+/// Recursively try every possible way to split `remaining` on `-` into
+/// filesystem path components, verifying each component exists on disk.
+/// Returns the first complete path that resolves successfully.
+fn search_from(remaining: &str, current: PathBuf) -> Option<String> {
+    if remaining.is_empty() {
+        return if current.exists() {
+            Some(current.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+    }
+
+    let bytes = remaining.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i <= len {
+        let at_sep = i < len && bytes[i] == b'-';
+        let at_end = i == len;
+        if at_sep || at_end {
+            let segment = &remaining[..i];
+            if !segment.is_empty() {
+                let next = current.join(segment);
+                if next.exists() {
+                    let rest = if at_end { "" } else { &remaining[i + 1..] };
+                    if let Some(result) = search_from(rest, next) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---- helpers -------------------------------------------------------------
