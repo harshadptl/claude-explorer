@@ -11,16 +11,16 @@ Claude Explorer is a Tauri v2 desktop app. The stack is:
 ```
 Frontend (Vite + vanilla JS/HTML/CSS)
         |
-        | window.__TAURI__.core.invoke('scan')
+        | window.__TAURI__.core.invoke('scan' | 'read_text_file' | 'write_settings' | 'open_in_editor')
         |
 Tauri bridge (IPC)
         |
 Rust backend (src-tauri/src/)
-  ├── main.rs       — Tauri entry point + command registration
+  ├── main.rs       — Tauri entry point + command registration + plugin init
   └── scanner.rs    — filesystem walker, returns Snapshot struct
 ```
 
-The frontend never touches the filesystem directly. All data comes from a single `scan` IPC call that returns a serialized `Snapshot` JSON object. The frontend is a pure read-only view over that snapshot.
+The frontend never touches the filesystem directly. All read data comes from a single `scan` IPC call that returns a serialized `Snapshot` JSON object. Writes (permissions editing) go through `write_settings`. File display in modals uses `read_text_file`. Opening files in an external editor uses `open_in_editor`.
 
 ---
 
@@ -35,11 +35,11 @@ claude-explorer/
 │   ├── style.css             # full design system (tokens, all components)
 │   └── main.js               # all JS: data loading, routing, rendering
 └── src-tauri/
-    ├── Cargo.toml            # Rust deps: tauri, serde, serde_yaml, dirs, walkdir, chrono, anyhow
+    ├── Cargo.toml            # Rust deps: tauri, serde, serde_json, serde_yaml, dirs, walkdir, chrono, anyhow
     ├── tauri.conf.json       # window config, CSP, build hooks
     ├── build.rs              # standard tauri build script
     └── src/
-        ├── main.rs           # registers `scan` and `read_text_file` commands
+        ├── main.rs           # registers 4 commands, inits shell + dialog plugins
         └── scanner.rs        # all filesystem logic, all data types
 ```
 
@@ -49,10 +49,10 @@ claude-explorer/
 
 ### 1. App starts → `loadData()` is called
 
-`src/main.js:30` — `loadData()` runs immediately on page load and again on every Rescan click.
+`src/main.js:35` — `loadData()` runs immediately on page load and again on every Rescan click. While scanning, the Rescan button is disabled and shows "Scanning…".
 
 ```js
-// main.js:35-43
+// main.js:40-44
 if (invoke) {
   state.data = await invoke('scan');   // inside Tauri → real data
 } else {
@@ -68,7 +68,7 @@ If `window.__TAURI__` is absent (plain `vite dev`), `invoke` is `undefined` and 
 
 ### 2. Rust `scan` command executes
 
-`src-tauri/src/main.rs:9-11` — the `scan` command simply delegates to `scanner::scan_all()`:
+`src-tauri/src/main.rs:8-11` — the `scan` command simply delegates to `scanner::scan_all()`:
 
 ```rust
 #[tauri::command]
@@ -79,21 +79,22 @@ fn scan() -> Result<Snapshot, String> {
 
 ### 3. `scanner::scan_all()` builds the Snapshot
 
-`scanner.rs:109-164` — the top-level scan function. It:
+`scanner.rs:110-173` — the top-level scan function. It:
 
-1. Resolves `~/.claude` via the `dirs` crate (`dirs::home_dir()`)
-2. Calls `scan_global()` to parse `settings.json`, `CLAUDE.md`, `~/.claude.json`
-3. Calls `scan_skills / scan_agents / scan_commands` on `~/.claude/skills`, `agents`, `commands`
-4. Extracts MCP servers and hooks from the parsed `settings_raw` JSON
-5. Calls `scan_projects()` which also recurses into each project's `.claude/` folder
+1. Resolves the config dir: checks `CLAUDE_CONFIG_DIR` env var first, falls back to `~/.claude` via `dirs::home_dir()`
+2. Records `claude_config_dir_override` on the snapshot if the env var is set, and adds a warning
+3. Calls `scan_global()` to parse `settings.json`, `CLAUDE.md`, `~/.claude.json`
+4. Calls `scan_skills / scan_agents / scan_commands` on `~/.claude/skills`, `agents`, `commands`
+5. Extracts MCP servers and hooks from the parsed `settings_raw` JSON
+6. Calls `scan_projects()` which also recurses into each project's `.claude/` folder
 
 ### 4. Snapshot is serialized and returned to JS
 
-All structs derive `serde::Serialize`. Tauri auto-serializes the return value to JSON. The JS receives a plain object that matches the `Snapshot` type definition (see below).
+All structs derive `serde::Serialize`. Tauri auto-serializes the return value to JSON. The JS receives a plain object matching the `Snapshot` type definition (see below).
 
 ### 5. Frontend renders
 
-`main.js:60-73` — `render()` dispatches to one of 7 view renderers based on `state.view`, injects the result as `innerHTML` into `#content`, then calls `attachModalHandlers()` to wire click events.
+`main.js:71-92` — `render()` dispatches to one of 7 view renderers based on `state.view`. If the Projects tab is active and `state.selectedProject` is set, it renders `renderProjectDetail()` instead. After injecting HTML into `#content`, it calls the appropriate event-wiring functions.
 
 ---
 
@@ -105,23 +106,24 @@ This is the contract between Rust and JS. Every renderer reads from this object.
 // TypeScript equivalent of scanner.rs structs
 
 interface Snapshot {
-  scanned_at: string;           // ISO datetime
+  scanned_at: string;                   // ISO datetime
   home_dir: string | null;
-  claude_dir: string | null;    // e.g. "/Users/you/.claude"
+  claude_dir: string | null;            // e.g. "/Users/you/.claude"
   claude_dir_exists: boolean;
+  claude_config_dir_override: string | null;  // set if CLAUDE_CONFIG_DIR env var is present
   global: GlobalConfig;
   skills: Skill[];
   agents: Agent[];
   commands: SlashCommand[];
   mcp_servers: McpServer[];
   hooks: Hook[];
-  projects: Project[];
+  projects: Project[];                  // sorted by last_modified desc
   warnings: string[];
 }
 
 interface GlobalConfig {
   settings_path: string | null;
-  settings_raw: object | null;  // raw parsed settings.json
+  settings_raw: object | null;  // raw parsed settings.json (used for write-back)
   model: string | null;
   theme: string | null;
   env: object | null;           // settings.json "env" block
@@ -195,6 +197,36 @@ interface Project {
 
 ---
 
+## Tauri Commands (main.rs)
+
+Four commands are registered:
+
+| Command | Direction | Purpose |
+|---|---|---|
+| `scan` | Rust → JS | Full filesystem scan; returns `Snapshot` |
+| `read_text_file(path)` | Rust → JS | Read any file as UTF-8 string |
+| `write_settings(path, content)` | JS → Rust | Overwrite a settings.json file |
+| `open_in_editor(path)` | JS → Rust | Open file in system default app via `tauri_plugin_shell` |
+
+Two plugins are initialized: `tauri_plugin_shell` (for `open_in_editor`) and `tauri_plugin_dialog` (available for future use).
+
+---
+
+## App State (main.js)
+
+```js
+const state = {
+  data: null,           // current Snapshot
+  view: 'overview',     // active tab
+  filters: {},          // per-tab filter strings, keyed by view name
+  selectedProject: null, // absolute path of drill-down project, or null
+};
+```
+
+`state.filters` is populated by `<input class="filter-input" data-filter-view="…">` elements. `attachModalHandlers()` wires these inputs — on each keystroke, the filter is saved to `state.filters[viewName]` and `render()` is called to re-filter.
+
+---
+
 ## View Renderers (main.js)
 
 Each renderer is a pure function `(data: Snapshot) => string` (HTML string).
@@ -203,13 +235,18 @@ Each renderer is a pure function `(data: Snapshot) => string` (HTML string).
 |---|---|---|
 | `renderOverview(d)` | Overview | `d.skills`, `d.agents`, `d.commands`, `d.mcp_servers`, `d.hooks`, `d.projects`, `d.global.model`, `d.global.permissions`, `d.warnings` |
 | `renderConfig(d)` | Config | `d.global` (all fields) |
-| `renderSkills(d)` | Skills | `d.skills[]` |
-| `renderProjects(d)` | Projects | `d.projects[]` |
-| `renderPermissions(d)` | Permissions | `d.global.permissions` |
+| `renderSkills(d)` | Skills | `d.skills[]`, `state.filters['skills']` |
+| `renderProjects(d)` | Projects | `d.projects[]`, `state.filters['projects']` |
+| `renderPermissions(d)` | Permissions | `d.global.permissions`, `d.global.settings_path` |
 | `renderMcp(d)` | MCP & Hooks | `d.mcp_servers[]`, `d.hooks[]` |
-| `renderAgentsAndCommands(d)` | Agents & Commands | `d.agents[]`, `d.commands[]` |
+| `renderAgentsAndCommands(d)` | Agents & Commands | `d.agents[]`, `d.commands[]`, `state.filters['agents']` |
+| `renderProjectDetail(d, path)` | Projects (drill-down) | single `Project` + all scoped skills/agents/commands/MCP/hooks |
 
-### Modal pattern (cards/projects)
+### Filter inputs
+
+Skills, Projects, and Agents & Commands tabs include a live filter input. The filter string is stored in `state.filters[viewName]` and applied before rendering the list. Focus is restored to the input after each re-render.
+
+### Modal pattern (cards)
 
 Any element with class `clickable` gets a click handler. Data is passed via `data-modal-*` attributes:
 
@@ -220,38 +257,69 @@ Any element with class `clickable` gets a click handler. Data is passed via `dat
      data-modal-body="first 600 chars of body">
 ```
 
-`attachModalHandlers()` (main.js:361) wires these after every render. `openModal()` creates/reuses a single `.modal-overlay` DOM node.
+`attachModalHandlers()` (`main.js:606`) wires these after every render. `openModal()` creates/reuses a single `.modal-overlay` DOM node.
 
-**Limitation:** The modal only shows `body_preview` (truncated). To show the full file, you'd call `invoke('read_text_file', { path })` — the command is already registered in `main.rs:14-16`.
+**Full file loading:** When running inside Tauri, `openModal()` immediately calls `invoke('read_text_file', { path })` and replaces the `body_preview` placeholder with the full file content once it loads. The modal also shows an "Open in editor" button that calls `invoke('open_in_editor', { path })`.
+
+### Project drill-down
+
+Clicking a project row sets `state.selectedProject` to the project's absolute path and calls `render()`. `render()` detects this and calls `renderProjectDetail()` instead of `renderProjects()`.
+
+`renderProjectDetail()` (`main.js:511`) renders:
+- Back button (clears `state.selectedProject`)
+- Project name, path, session count
+- CLAUDE.md preview (full content loaded async via `read_text_file`)
+- settings.json (loaded async, syntax-highlighted via `highlightJson()`)
+- Project-scoped skills, agents, slash commands, MCP servers, hooks (filtered from the global snapshot by `scope === projectPath`)
+
+`attachProjectDetailHandlers()` (`main.js:477`) wires the back button and triggers the async file loads.
+
+---
+
+## Permissions Editor
+
+The Permissions tab is the only view that writes back to disk.
+
+`renderPermissions(d)` (`main.js:270`) checks `canEdit = !!(invoke && d.global.settings_path)`. If true, each rule gets a `×` delete button and each column gets an "+ Add rule" button.
+
+`attachPermissionHandlers()` (`main.js:410`) wires:
+- **Delete:** removes the rule at `data-perm-index` from `state.data.global.permissions[type]` and calls `savePermissions()`
+- **Add:** replaces the "+ Add rule" button with an inline input form; on Save calls `savePermissions()`
+
+`savePermissions(newPerms)` (`main.js:453`):
+1. Deep-clones `settings_raw`
+2. Patches `permissions.allow/deny/ask` in place
+3. Calls `invoke('write_settings', { path, content: JSON.stringify(updated, null, 2) })`
+4. Calls `loadData()` to rescan and re-render with the saved state
 
 ---
 
 ## Rust Scanner Deep Dive
 
-### `scan_global()` — `scanner.rs:168`
+### `scan_global()` — `scanner.rs:177`
 
 Reads `~/.claude/settings.json` and extracts:
 - `model`, `theme` — top-level string fields
 - `env` — entire env block passed through as raw JSON
 - `permissions.allow/deny/ask` — collected as `Vec<String>` via `collect_strings()`
-- `settings_raw` — full parsed JSON (used for raw display and MCP/hooks extraction)
+- `settings_raw` — full parsed JSON (used for raw display, MCP/hooks extraction, and write-back)
 - `CLAUDE.md` — read if present, truncated to 800 chars
-- `~/.claude.json` — path + size only (never parsed, can be 100MB+)
+- `~/.claude.json` — path + size only (never parsed, can be 100 MB+)
 
-### `parse_skill()` / `parse_agent()` — `scanner.rs:258, 326`
+### `parse_skill()` / `parse_agent()` — `scanner.rs:267, 335`
 
 Both use `split_frontmatter()` to separate YAML frontmatter (between `---` delimiters) from the body. YAML is parsed with `serde_yaml`. Fields come from frontmatter; `name` falls back to directory/filename.
 
-`split_frontmatter()` at `scanner.rs:597`:
+`split_frontmatter()` at `scanner.rs:624`:
 - Looks for opening `---` at start of file
 - Finds closing `\n---` to delimit the frontmatter block
 - Returns `(frontmatter_str, body_str)` tuple
 
-### `extract_mcp_from_settings()` — `scanner.rs:389`
+### `extract_mcp_from_settings()` — `scanner.rs:398`
 
-Reads `settings.json → mcpServers` object. Each key is a server name. Transport is inferred: if `url` is present → `"http"`, otherwise → `"stdio"`.
+Reads `settings.json → mcpServers` object. Each key is a server name. Transport is inferred: if a `transport` field exists it is used directly; if `url` is present → `"http"`, otherwise → `"stdio"`.
 
-### `extract_hooks_from_settings()` — `scanner.rs:415`
+### `extract_hooks_from_settings()` — `scanner.rs:424`
 
 Reads `settings.json → hooks` object. The schema Claude Code uses is:
 ```json
@@ -265,36 +333,27 @@ Reads `settings.json → hooks` object. The schema Claude Code uses is:
 ```
 The extractor handles both the nested `hooks: [...]` form and a flat `command` directly on the entry.
 
-### `scan_projects()` — `scanner.rs:455`
+### `scan_projects()` — `scanner.rs:464`
 
 - Reads `~/.claude/projects/` directory
-- Each subdirectory name is an encoded project path (dashes replace slashes)
-- `decode_project_dir()` (`scanner.rs:576`) reverses this: leading `-` means it's an encoded path
+- Each subdirectory name is an encoded project path (slashes replaced with dashes)
+- `decode_project_dir()` (`scanner.rs:597`) reverses this: leading `-` means it's an encoded path; does a simple `-` → `/` replacement
+- `resolve_project_path()` (`scanner.rs:606`) wraps the decoder and also checks whether the decoded path actually exists on disk
+- If the path doesn't exist, a warning is emitted (dash-in-dirname ambiguity); the project still appears in the list but without MD/CFG resolution
 - Counts `.jsonl` files = session count, takes newest mtime
-- If decoded path exists on disk, reads `CLAUDE.md`, `.claude/settings.json`, and recurses into `.claude/` for project-scoped skills/agents/commands/MCP/hooks
-- Also checks for `.mcp.json` at project root
+- If decoded path exists on disk, reads `CLAUDE.md`, `.claude/settings.json`, and recurses into `.claude/` for project-scoped skills/agents/commands/MCP/hooks; also checks `.mcp.json` at project root
+- Results are sorted by `last_modified` descending before returning
 
-**Known limitation** (`decode_project_dir`, `scanner.rs:576-583`): The decode is a simple `-` → `/` replacement. Paths with dashes in directory names (e.g. `/Users/you/my-project`) decode incorrectly. This is noted in README.md.
+**Known limitation** (`decode_project_dir`, `scanner.rs:597-601`): The decode is a simple `-` → `/` replacement. Paths with dashes in directory names (e.g. `/Users/you/my-project`) decode incorrectly. This is noted in README.md.
 
 ---
 
-## The `read_text_file` Command
+## Chrome: Footer and Header
 
-`main.rs:13-16` — already registered but not yet called from the frontend:
-
-```rust
-#[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {path}: {e}"))
-}
-```
-
-Call from JS:
-```js
-const content = await invoke('read_text_file', { path: '/absolute/path/to/file' });
-```
-
-This is what you'd use to show full file contents in modals instead of truncated previews.
+`updateChrome()` (`main.js:56`) runs after every scan:
+- Sets the scanned-at timestamp pill to `HH:MM`
+- Footer path shows `claude_dir`; if `claude_config_dir_override` is set, appends `(CLAUDE_CONFIG_DIR)` to signal the non-default location
+- Footer warnings count shows total `warnings.length`
 
 ---
 
@@ -322,7 +381,7 @@ Layout is a 4-row CSS grid: `header / tabs / content / footer`.
 
 ## Mock Data (for UI-only dev)
 
-`main.js:453-501` — `mockData()` returns a hardcoded `Snapshot`. It mirrors the real data shape exactly. When iterating on UI without running the Tauri shell, run `npm run dev` and the app renders against this fixture.
+`main.js:731` — `mockData()` returns a hardcoded `Snapshot`. It mirrors the real data shape exactly, including the `claude_config_dir_override: null` field. When iterating on UI without running the Tauri shell, run `npm run dev` and the app renders against this fixture.
 
 To update the mock, edit `mockData()` directly. The shape must match the `Snapshot` interface above.
 
