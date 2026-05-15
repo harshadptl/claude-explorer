@@ -5,6 +5,8 @@ const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI__?.invoke;
 const state = {
   data: null,
   view: 'overview',
+  filters: {},
+  selectedProject: null,
 };
 
 const el = {
@@ -22,6 +24,7 @@ el.rescan.addEventListener('click', loadData);
 el.tabs.forEach(tab => {
   tab.addEventListener('click', () => {
     state.view = tab.dataset.view;
+    state.selectedProject = null;
     el.tabs.forEach(t => t.classList.toggle('active', t === tab));
     render();
   });
@@ -31,6 +34,8 @@ loadData();
 
 async function loadData() {
   el.content.innerHTML = '<div class="loading">Scanning your filesystem</div>';
+  el.rescan.disabled = true;
+  el.rescan.textContent = '↻ Scanning…';
   try {
     if (invoke) {
       state.data = await invoke('scan');
@@ -40,6 +45,9 @@ async function loadData() {
   } catch (err) {
     el.content.innerHTML = `<div class="empty-state"><div class="glyph">✕</div><p>Scan failed: ${escapeHtml(String(err))}</p></div>`;
     return;
+  } finally {
+    el.rescan.disabled = false;
+    el.rescan.textContent = '↻ Rescan';
   }
   updateChrome();
   render();
@@ -50,7 +58,10 @@ function updateChrome() {
   if (!d) return;
   const dt = new Date(d.scanned_at);
   el.scannedAt.textContent = `scanned ${formatTime(dt)}`;
-  el.footerPath.textContent = d.claude_dir || '~/.claude (not found)';
+  const pathLabel = d.claude_dir || '~/.claude (not found)';
+  el.footerPath.textContent = d.claude_config_dir_override
+    ? `${pathLabel} (CLAUDE_CONFIG_DIR)`
+    : pathLabel;
   const wc = d.warnings?.length || 0;
   el.footerWarnings.textContent = `${wc} warning${wc === 1 ? '' : 's'}`;
 }
@@ -59,6 +70,12 @@ function updateChrome() {
 
 function render() {
   if (!state.data) return;
+  if (state.view === 'projects' && state.selectedProject) {
+    el.content.innerHTML = renderProjectDetail(state.data, state.selectedProject);
+    attachModalHandlers();
+    attachProjectDetailHandlers();
+    return;
+  }
   const renderers = {
     overview: renderOverview,
     config: renderConfig,
@@ -70,6 +87,8 @@ function render() {
   };
   el.content.innerHTML = renderers[state.view]?.(state.data) ?? '<p>not implemented</p>';
   attachModalHandlers();
+  attachProjectRowHandlers();
+  if (state.view === 'permissions') attachPermissionHandlers();
 }
 
 function renderOverview(d) {
@@ -170,17 +189,22 @@ function renderSkills(d) {
   if (!d.skills.length) {
     return emptyState('No skills yet', 'No SKILL.md files were found in ~/.claude/skills or any project .claude/skills.');
   }
+  const q = (state.filters['skills'] || '').toLowerCase();
+  const skills = q
+    ? d.skills.filter(s => (s.name + ' ' + (s.description || '')).toLowerCase().includes(q))
+    : d.skills;
   return `
     <div class="section-head">
       <h2>The <em>skills</em> library</h2>
-      <span class="count">${d.skills.length} total</span>
+      <span class="count">${skills.length} of ${d.skills.length}</span>
     </div>
     <p class="kicker">
       Skills are workflows Claude can summon on its own when the conversation matches.
       Each card is a real SKILL.md on disk — click to read the body.
     </p>
-    <div class="card-grid">
-      ${d.skills.map(s => skillCard(s)).join('')}
+    <input class="filter-input" data-filter-view="skills" placeholder="Filter skills…" value="${escapeHtml(state.filters['skills'] || '')}">
+    <div class="card-grid" style="margin-top:16px;">
+      ${skills.length ? skills.map(s => skillCard(s)).join('') : '<div class="perm-empty" style="border:1px solid var(--rule);padding:24px;">no matches</div>'}
     </div>
   `;
 }
@@ -207,21 +231,23 @@ function renderProjects(d) {
   if (!d.projects.length) {
     return emptyState('No projects yet', 'Once you run Claude Code in a directory, it shows up here.');
   }
+  const q = (state.filters['projects'] || '').toLowerCase();
+  const projects = q
+    ? d.projects.filter(p => (p.name + ' ' + p.path).toLowerCase().includes(q))
+    : d.projects;
   return `
     <div class="section-head">
       <h2>Your <em>projects</em></h2>
-      <span class="count">${d.projects.length} tracked</span>
+      <span class="count">${projects.length} of ${d.projects.length} tracked</span>
     </div>
     <p class="kicker">
       Every directory you've opened a Claude Code session in, with session counts and
       a peek at the project's CLAUDE.md when available.
     </p>
-    <div>
-      ${d.projects.map(p => `
-        <div class="project clickable"
-             data-modal-title="${escapeHtml(p.name)}"
-             data-modal-path="${escapeHtml(p.path)}"
-             data-modal-body="${escapeHtml(p.claude_md_preview || '(no CLAUDE.md)')}">
+    <input class="filter-input" data-filter-view="projects" placeholder="Filter projects…" value="${escapeHtml(state.filters['projects'] || '')}">
+    <div style="margin-top:16px;">
+      ${projects.length ? projects.map(p => `
+        <div class="project project-row" data-project-path="${escapeHtml(p.path)}">
           <div>
             <h3 class="project-name">${escapeHtml(p.name)}</h3>
             <div class="project-path">${escapeHtml(p.path)}</div>
@@ -236,23 +262,37 @@ function renderProjects(d) {
             <span class="flag ${p.has_settings ? 'on' : ''}">CFG</span>
           </div>
         </div>
-      `).join('')}
+      `).join('') : '<div class="perm-empty" style="border:1px solid var(--rule);padding:24px;">no matches</div>'}
     </div>
   `;
 }
 
 function renderPermissions(d) {
   const p = d.global.permissions;
-  const col = (label, klass, rules) => `
+  const canEdit = !!(invoke && d.global.settings_path);
+  const col = (label, klass, type, rules) => `
     <div class="perm-col">
       <div class="perm-head ${klass}">${label} <span class="ct">${rules.length}</span></div>
       <div class="perm-list">
         ${rules.length
-          ? rules.map(r => `<div class="perm-rule">${escapeHtml(r)}</div>`).join('')
+          ? rules.map((r, i) => `
+            <div class="perm-rule">
+              ${escapeHtml(r)}
+              ${canEdit ? `<button class="perm-delete" data-perm-type="${type}" data-perm-index="${i}" title="Remove rule">×</button>` : ''}
+            </div>`).join('')
           : '<div class="perm-empty">no rules</div>'}
       </div>
+      ${canEdit ? `
+        <div class="perm-add-row" id="perm-add-${type}">
+          <button class="btn perm-add-btn" data-perm-type="${type}" style="width:100%;font-size:10px;margin:8px 0 0;">+ Add rule</button>
+        </div>
+      ` : ''}
     </div>
   `;
+  const editWarning = !canEdit && invoke ? `
+    <div class="perm-empty" style="border:1px dashed var(--rule);padding:12px;margin-bottom:16px;font-size:11px;">
+      Settings file not found — cannot edit permissions.
+    </div>` : '';
   return `
     <div class="section-head">
       <h2><em>Permissions</em></h2>
@@ -262,10 +302,11 @@ function renderPermissions(d) {
       What Claude is allowed to do, must ask about, and is forbidden from.
       Deny rules win over allow rules — even when both match.
     </p>
+    ${editWarning}
     <div class="perm-grid">
-      ${col('Allow', 'allow', p.allow)}
-      ${col('Ask', 'ask', p.ask)}
-      ${col('Deny', 'deny', p.deny)}
+      ${col('Allow', 'allow', 'allow', p.allow)}
+      ${col('Ask', 'ask', 'ask', p.ask)}
+      ${col('Deny', 'deny', 'deny', p.deny)}
     </div>
   `;
 }
@@ -313,14 +354,22 @@ function renderMcp(d) {
 }
 
 function renderAgentsAndCommands(d) {
+  const q = (state.filters['agents'] || '').toLowerCase();
+  const agents = q
+    ? d.agents.filter(a => (a.name + ' ' + (a.description || '')).toLowerCase().includes(q))
+    : d.agents;
+  const commands = q
+    ? d.commands.filter(c => c.name.toLowerCase().includes(q))
+    : d.commands;
   return `
+    <input class="filter-input" data-filter-view="agents" placeholder="Filter agents &amp; commands…" value="${escapeHtml(state.filters['agents'] || '')}" style="margin-bottom:24px;">
     <div class="section-head">
       <h2><em>Agents</em></h2>
-      <span class="count">${d.agents.length} defined</span>
+      <span class="count">${agents.length} of ${d.agents.length} defined</span>
     </div>
-    ${d.agents.length ? `
+    ${agents.length ? `
       <div class="card-grid">
-        ${d.agents.map(a => `
+        ${agents.map(a => `
           <div class="card clickable" data-modal-title="${escapeHtml(a.name)}" data-modal-path="${escapeHtml(a.path)}" data-modal-body="${escapeHtml(a.body_preview)}">
             <div class="card-head">
               <h3 class="card-title">${escapeHtml(a.name)}</h3>
@@ -338,11 +387,11 @@ function renderAgentsAndCommands(d) {
 
     <div class="section-head" style="margin-top:40px;">
       <h2><em>Slash</em> commands</h2>
-      <span class="count">${d.commands.length} commands</span>
+      <span class="count">${commands.length} of ${d.commands.length} commands</span>
     </div>
-    ${d.commands.length ? `
+    ${commands.length ? `
       <div class="card-grid">
-        ${d.commands.map(c => `
+        ${commands.map(c => `
           <div class="card clickable" data-modal-title="/${escapeHtml(c.name)}" data-modal-path="${escapeHtml(c.path)}" data-modal-body="${escapeHtml(c.body_preview)}">
             <div class="card-head">
               <h3 class="card-title">/${escapeHtml(c.name)}</h3>
@@ -356,6 +405,202 @@ function renderAgentsAndCommands(d) {
   `;
 }
 
+// ---- permissions editor --------------------------------------------------
+
+function attachPermissionHandlers() {
+  // Delete rule
+  document.querySelectorAll('.perm-delete').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const type = btn.dataset.permType;
+      const idx  = parseInt(btn.dataset.permIndex, 10);
+      const rules = [...state.data.global.permissions[type]];
+      rules.splice(idx, 1);
+      savePermissions({ ...state.data.global.permissions, [type]: rules });
+    });
+  });
+
+  // Show add-rule inline form
+  document.querySelectorAll('.perm-add-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const type = btn.dataset.permType;
+      const row  = document.getElementById(`perm-add-${type}`);
+      if (!row) return;
+      row.innerHTML = `
+        <div style="display:flex;gap:4px;padding:8px 0;">
+          <input class="filter-input perm-new-input" placeholder="e.g. Bash(npm:*)" style="flex:1;">
+          <button class="btn perm-save-btn" data-perm-type="${type}" style="font-size:10px;">Save</button>
+          <button class="btn perm-cancel-btn" style="font-size:10px;">✕</button>
+        </div>
+      `;
+      const input = row.querySelector('.perm-new-input');
+      input.focus();
+      row.querySelector('.perm-cancel-btn').addEventListener('click', render);
+      row.querySelector('.perm-save-btn').addEventListener('click', () => {
+        const val = input.value.trim();
+        if (!val) return;
+        const rules = [...state.data.global.permissions[type], val];
+        savePermissions({ ...state.data.global.permissions, [type]: rules });
+      });
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') row.querySelector('.perm-save-btn').click();
+        if (e.key === 'Escape') render();
+      });
+    });
+  });
+}
+
+async function savePermissions(newPerms) {
+  const d = state.data;
+  if (!invoke || !d.global.settings_path) return;
+  const updated = JSON.parse(JSON.stringify(d.global.settings_raw || {}));
+  updated.permissions = { allow: newPerms.allow, deny: newPerms.deny, ask: newPerms.ask };
+  try {
+    await invoke('write_settings', { path: d.global.settings_path, content: JSON.stringify(updated, null, 2) });
+    await loadData();
+  } catch (err) {
+    alert(`Failed to save settings: ${err}`);
+  }
+}
+
+// ---- project handlers & detail -------------------------------------------
+
+function attachProjectRowHandlers() {
+  document.querySelectorAll('.project-row').forEach(row => {
+    row.addEventListener('click', () => {
+      state.selectedProject = row.dataset.projectPath;
+      render();
+    });
+  });
+}
+
+function attachProjectDetailHandlers() {
+  const backBtn = document.getElementById('proj-back');
+  if (backBtn) {
+    backBtn.addEventListener('click', () => {
+      state.selectedProject = null;
+      render();
+    });
+  }
+  // Load CLAUDE.md content if invoke is available
+  const mdPre = document.getElementById('proj-md-pre');
+  if (mdPre && invoke) {
+    const mdPath = mdPre.dataset.path;
+    if (mdPath) {
+      invoke('read_text_file', { path: mdPath }).then(full => {
+        mdPre.textContent = full;
+      }).catch(() => {});
+    }
+  }
+  // Load settings.json
+  const settingsPre = document.getElementById('proj-settings-pre');
+  if (settingsPre && invoke) {
+    const p = state.data?.projects.find(x => x.path === state.selectedProject);
+    if (p?.settings_path) {
+      invoke('read_text_file', { path: p.settings_path }).then(text => {
+        try {
+          settingsPre.innerHTML = highlightJson(JSON.parse(text));
+        } catch {
+          settingsPre.textContent = text;
+        }
+      }).catch(() => { settingsPre.textContent = '(could not load)'; });
+    }
+  }
+}
+
+function renderProjectDetail(d, projectPath) {
+  const p = d.projects.find(x => x.path === projectPath);
+  if (!p) return emptyState('Project not found', 'The selected project could not be found in the snapshot.');
+
+  const skills   = d.skills.filter(x => x.scope === projectPath);
+  const agents   = d.agents.filter(x => x.scope === projectPath);
+  const commands = d.commands.filter(x => x.scope === projectPath);
+  const mcps     = d.mcp_servers.filter(x => x.scope === projectPath);
+  const hooks    = d.hooks.filter(x => x.scope === projectPath);
+
+  const mdSection = p.has_claude_md && p.claude_md_preview ? `
+    <div class="section-head" style="margin-top:40px;"><h2>CLAUDE.md</h2><span class="count">project memory</span></div>
+    <pre class="json" id="proj-md-pre" data-path="${escapeHtml(p.path + '/CLAUDE.md')}">${escapeHtml(p.claude_md_preview)}</pre>
+  ` : '';
+
+  const settingsSection = p.has_settings && p.settings_path ? `
+    <div class="section-head" style="margin-top:40px;"><h2>settings.json</h2><span class="count">project config</span></div>
+    <pre class="json" id="proj-settings-pre">${escapeHtml('(loading…)')}</pre>
+  ` : '';
+
+  const skillsSection = skills.length ? `
+    <div class="section-head" style="margin-top:40px;"><h2>Skills</h2><span class="count">${skills.length}</span></div>
+    <div class="card-grid">${skills.map(s => skillCard(s)).join('')}</div>
+  ` : '';
+
+  const agentsSection = agents.length ? `
+    <div class="section-head" style="margin-top:40px;"><h2>Agents</h2><span class="count">${agents.length}</span></div>
+    <div class="card-grid">${agents.map(a => `
+      <div class="card clickable" data-modal-title="${escapeHtml(a.name)}" data-modal-path="${escapeHtml(a.path)}" data-modal-body="${escapeHtml(a.body_preview)}">
+        <div class="card-head"><h3 class="card-title">${escapeHtml(a.name)}</h3></div>
+        <p class="card-desc">${escapeHtml(a.description || 'No description.')}</p>
+      </div>`).join('')}
+    </div>
+  ` : '';
+
+  const commandsSection = commands.length ? `
+    <div class="section-head" style="margin-top:40px;"><h2>Slash commands</h2><span class="count">${commands.length}</span></div>
+    <div class="card-grid">${commands.map(c => `
+      <div class="card clickable" data-modal-title="/${escapeHtml(c.name)}" data-modal-path="${escapeHtml(c.path)}" data-modal-body="${escapeHtml(c.body_preview)}">
+        <div class="card-head"><h3 class="card-title">/${escapeHtml(c.name)}</h3></div>
+        <p class="card-desc">${escapeHtml(c.body_preview || '(empty)')}</p>
+      </div>`).join('')}
+    </div>
+  ` : '';
+
+  const mcpSection = mcps.length ? `
+    <div class="section-head" style="margin-top:40px;"><h2>MCP servers</h2><span class="count">${mcps.length}</span></div>
+    <div class="mcp-list">${mcps.map(m => `
+      <div class="mcp-item">
+        <div><div class="mcp-name">${escapeHtml(m.name)}</div><div class="mcp-transport">${escapeHtml(m.transport || 'unknown')}</div></div>
+        <div class="mcp-cmd">${escapeHtml(m.url || m.command || '—')}</div>
+        <div></div>
+      </div>`).join('')}
+    </div>
+  ` : '';
+
+  const hooksSection = hooks.length ? `
+    <div class="section-head" style="margin-top:40px;"><h2>Hooks</h2><span class="count">${hooks.length}</span></div>
+    <div class="hook-list">${hooks.map(h => `
+      <div class="hook-item">
+        <div><div class="hook-event">${escapeHtml(h.event)}</div>${h.matcher ? `<div class="hook-matcher">matches: ${escapeHtml(h.matcher)}</div>` : ''}</div>
+        <div class="hook-cmd">${escapeHtml(h.command || '—')}</div>
+        <div></div>
+      </div>`).join('')}
+    </div>
+  ` : '';
+
+  return `
+    <div style="display:flex; align-items:center; gap:16px; margin-bottom:24px;">
+      <button id="proj-back" class="btn">← Back</button>
+      <div class="proj-flags">
+        <span class="flag ${p.has_claude_md ? 'on' : ''}">MD</span>
+        <span class="flag ${p.has_settings ? 'on' : ''}">CFG</span>
+      </div>
+    </div>
+    <div class="section-head">
+      <h2><em>${escapeHtml(p.name)}</em></h2>
+      <span class="count">${p.session_count} sessions</span>
+    </div>
+    <div class="project-path" style="margin-bottom:24px;">${escapeHtml(p.path)}</div>
+    ${mdSection}
+    ${settingsSection}
+    ${skillsSection}
+    ${agentsSection}
+    ${commandsSection}
+    ${mcpSection}
+    ${hooksSection}
+    ${!mdSection && !settingsSection && !skillsSection && !agentsSection && !commandsSection && !mcpSection && !hooksSection
+      ? '<div class="perm-empty" style="border:1px solid var(--rule);padding:24px;margin-top:24px;">No project-scoped configuration found.</div>'
+      : ''}
+  `;
+}
+
 // ---- modal ---------------------------------------------------------------
 
 function attachModalHandlers() {
@@ -366,6 +611,15 @@ function attachModalHandlers() {
         path: c.dataset.modalPath,
         body: c.dataset.modalBody,
       });
+    });
+  });
+  document.querySelectorAll('.filter-input').forEach(input => {
+    input.addEventListener('input', e => {
+      state.filters[e.target.dataset.filterView] = e.target.value;
+      render();
+      // Restore focus to the filter input after re-render
+      const restored = document.querySelector(`.filter-input[data-filter-view="${e.target.dataset.filterView}"]`);
+      if (restored) { restored.focus(); restored.setSelectionRange(restored.value.length, restored.value.length); }
     });
   });
 }
@@ -383,16 +637,40 @@ function openModal({ title, path, body }) {
       if (e.key === 'Escape') closeModal();
     });
   }
+  const initialContent = invoke && path ? 'Loading\u2026' : escapeHtml(body || '');
+  const editorBtn = invoke && path
+    ? `<button class="modal-editor-btn btn" aria-label="open in editor">Open in editor</button>`
+    : '';
   overlay.innerHTML = `
     <div class="modal">
       <button class="modal-close" aria-label="close">×</button>
       <h3>${escapeHtml(title || '')}</h3>
       <div class="modal-path">${escapeHtml(path || '')}</div>
-      <pre>${escapeHtml(body || '')}</pre>
+      ${editorBtn}
+      <pre>${initialContent}</pre>
     </div>
   `;
   overlay.classList.add('open');
   overlay.querySelector('.modal-close').addEventListener('click', closeModal);
+  const editorBtnEl = overlay.querySelector('.modal-editor-btn');
+  if (editorBtnEl) {
+    editorBtnEl.addEventListener('click', () => {
+      invoke('open_in_editor', { path }).catch(err => {
+        alert(`Could not open file: ${err}`);
+      });
+    });
+  }
+
+  // Load full file content when running inside Tauri
+  if (invoke && path) {
+    invoke('read_text_file', { path }).then(full => {
+      const pre = overlay.querySelector('.modal pre');
+      if (pre) pre.textContent = full;
+    }).catch(() => {
+      const pre = overlay.querySelector('.modal pre');
+      if (pre && body) pre.textContent = body;
+    });
+  }
 }
 
 function closeModal() {
@@ -456,6 +734,7 @@ function mockData() {
     home_dir: '/Users/you',
     claude_dir: '/Users/you/.claude',
     claude_dir_exists: true,
+    claude_config_dir_override: null,
     global: {
       settings_path: '/Users/you/.claude/settings.json',
       model: 'claude-sonnet-4-6',

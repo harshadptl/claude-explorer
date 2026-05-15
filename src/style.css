@@ -93,6 +93,7 @@ body::before {
   transition: all 120ms ease;
 }
 .btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ---- Tabs ---- */
 .tabs {
@@ -357,6 +358,19 @@ pre.json .b { color: var(--accent-hot); }
   word-break: break-all;
 }
 .perm-rule:last-child { border-bottom: none; }
+.perm-rule { display: flex; justify-content: space-between; align-items: center; }
+.perm-delete {
+  background: transparent;
+  border: none;
+  color: var(--ink-faint);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.perm-delete:hover { color: var(--accent-hot); }
+.perm-add-row { padding: 4px 8px 8px; }
 .perm-empty {
   padding: 16px;
   color: var(--ink-faint);
@@ -496,6 +510,11 @@ pre.json .b { color: var(--accent-hot); }
   cursor: pointer;
 }
 .modal-close:hover { color: var(--accent-hot); }
+.modal-editor-btn {
+  position: absolute;
+  top: 16px; right: 52px;
+  font-size: 10px;
+}
 .modal h3 {
   font-family: var(--serif);
   font-size: 28px;
@@ -531,6 +550,22 @@ pre.json .b { color: var(--accent-hot); }
   gap: 12px;
 }
 .footer-sep { color: var(--rule); }
+
+/* ---- Filter input ---- */
+.filter-input {
+  width: 100%;
+  background: var(--bg-elev);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+  padding: 8px 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+.filter-input:focus { border-color: var(--accent); }
+.filter-input::placeholder { color: var(--ink-faint); }
 
 /* ---- Scrollbar ---- */
 ::-webkit-scrollbar { width: 8px; height: 8px; }

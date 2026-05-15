@@ -11,6 +11,7 @@ pub struct Snapshot {
     pub home_dir: Option<String>,
     pub claude_dir: Option<String>,
     pub claude_dir_exists: bool,
+    pub claude_config_dir_override: Option<String>,
     pub global: GlobalConfig,
     pub skills: Vec<Skill>,
     pub agents: Vec<Agent>,
@@ -110,7 +111,14 @@ pub fn scan_all() -> Result<Snapshot> {
     let mut warnings: Vec<String> = Vec::new();
 
     let home = dirs::home_dir();
-    let claude_dir = home.as_ref().map(|h| h.join(".claude"));
+    let config_dir_override = std::env::var("CLAUDE_CONFIG_DIR").ok();
+    let claude_dir = config_dir_override
+        .as_ref()
+        .map(|s| PathBuf::from(s))
+        .or_else(|| home.as_ref().map(|h| h.join(".claude")));
+    if let Some(ref ov) = config_dir_override {
+        warnings.push(format!("CLAUDE_CONFIG_DIR is set: using {ov} instead of ~/.claude"));
+    }
     let claude_dir_exists = claude_dir
         .as_ref()
         .map(|p| p.exists())
@@ -152,6 +160,7 @@ pub fn scan_all() -> Result<Snapshot> {
         home_dir: home.as_ref().map(|p| p.to_string_lossy().into_owned()),
         claude_dir: claude_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
         claude_dir_exists,
+        claude_config_dir_override: config_dir_override,
         global,
         skills,
         agents,
@@ -486,8 +495,15 @@ fn scan_projects(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "?".into());
 
-        // Project directory names are typically the encoded project path: -Users-name-repos-foo
-        let decoded_path = decode_project_dir(&name);
+        // Project directory names encode the absolute path: -Users-name-repos-foo
+        let (decoded_path, path_exists_on_disk) = resolve_project_path(&name);
+        if !path_exists_on_disk {
+            warnings.push(format!(
+                "Project path could not be resolved on disk: {} (decoded from {}). \
+                 Path may contain dashes in directory names.",
+                decoded_path, name
+            ));
+        }
 
         // Count session transcripts (.jsonl files) and find last modified
         let mut session_count = 0;
@@ -509,7 +525,7 @@ fn scan_projects(
 
         // If we can resolve the real project path on disk, look for .claude/ files there too
         let real_path = PathBuf::from(&decoded_path);
-        let (has_claude_md, claude_md_preview, has_settings, settings_path) = if real_path.exists() {
+        let (has_claude_md, claude_md_preview, has_settings, settings_path) = if path_exists_on_disk {
             let proj_claude = real_path.join(".claude");
             let md = real_path.join("CLAUDE.md");
             let md_preview = if md.exists() {
@@ -571,15 +587,26 @@ fn scan_projects(
 }
 
 /// Project directories in ~/.claude/projects encode the absolute path by
-/// replacing `/` with `-`. This converts back. It's heuristic — works for
-/// typical *nix paths, falls back to the original on anything ambiguous.
+/// replacing `/` with `-`. This converts back heuristically.
+///
+/// The naive approach (replace all `-` with `/`) works for paths whose
+/// directory components contain no dashes. For paths like `/Users/jane/my-project`,
+/// we first try the naive decode; if that path exists we're done. If not, we
+/// return the naive decode anyway and the caller emits a warning — the project
+/// will still appear in the list but without MD/CFG resolution.
 fn decode_project_dir(encoded: &str) -> String {
-    if encoded.starts_with('-') {
-        let s = encoded.replace('-', "/");
-        s
-    } else {
-        encoded.to_string()
+    if !encoded.starts_with('-') {
+        return encoded.to_string();
     }
+    encoded.replace('-', "/")
+}
+
+/// Attempt to resolve a decoded project path. Returns the path string and
+/// whether it was confirmed to exist on disk.
+fn resolve_project_path(encoded: &str) -> (String, bool) {
+    let decoded = decode_project_dir(encoded);
+    let exists = PathBuf::from(&decoded).exists();
+    (decoded, exists)
 }
 
 // ---- helpers -------------------------------------------------------------
